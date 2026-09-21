@@ -10,9 +10,13 @@ import android.graphics.drawable.GradientDrawable
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import android.util.Log
 import android.view.Gravity
 import android.view.MotionEvent
@@ -20,6 +24,7 @@ import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.view.accessibility.AccessibilityWindowInfo
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.ProgressBar
@@ -35,12 +40,14 @@ class WhisperAccessibilityService : AccessibilityService() {
         var instance: WhisperAccessibilityService? = null
         private const val TAG = "PhoneWhisper"
         private const val SAMPLE_RATE = 16000
-        private const val BTN_DP = 44
-        private const val PAD_DP = 10
+        private const val BTN_DP = 52
+        private const val PAD_DP = 12
         private const val MARGIN_DP = 8
         private const val TAP_THRESHOLD_DP = 10
-        private const val RING_DP = 56
-        private const val FEEDBACK_OFFSET_DP = 64
+        private const val RING_DP = 64
+        private const val FEEDBACK_OFFSET_DP = 72
+        private const val HIDE_OVERLAY_DELAY_MS = 450L
+        private const val REFRESH_OVERLAY_DELAY_MS = 80L
 
         private const val COLOR_IDLE = 0xDD1C1C1E.toInt()
         private const val COLOR_RECORDING = 0xDDEF4444.toInt()
@@ -66,6 +73,10 @@ class WhisperAccessibilityService : AccessibilityService() {
             feedbackView?.visibility = View.GONE
         }?.start()
     }
+    private val refreshOverlayVisibility = Runnable { updateOverlayVisibility() }
+    private val hideOverlay = Runnable {
+        if (state == State.IDLE && !hasTextInputContext()) hideOverlayNow()
+    }
 
     // Local transcription engine (loaded lazily)
     private var localTranscriber: LocalTranscriber? = null
@@ -77,15 +88,21 @@ class WhisperAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         instance = this
         showOverlay()
+        scheduleOverlayVisibilityUpdate()
         // Try to load local model in background
         thread { initLocalModel() }
     }
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        scheduleOverlayVisibilityUpdate()
+    }
     override fun onInterrupt() {}
 
     override fun onDestroy() {
         instance = null
+        handler.removeCallbacks(refreshOverlayVisibility)
+        handler.removeCallbacks(hideOverlay)
+        handler.removeCallbacks(hideFeedback)
         removeOverlay()
         super.onDestroy()
     }
@@ -137,6 +154,8 @@ class WhisperAccessibilityService : AccessibilityService() {
         val overlay = FrameLayout(this).apply {
             addView(ring, FrameLayout.LayoutParams(ringSize, ringSize, Gravity.CENTER))
             addView(img, FrameLayout.LayoutParams(buttonSize, buttonSize, Gravity.CENTER))
+            alpha = 0f
+            visibility = View.GONE
         }
 
         val params = WindowManager.LayoutParams(
@@ -217,6 +236,72 @@ class WhisperAccessibilityService : AccessibilityService() {
         feedbackView = feedback
         layoutParams = params
         feedbackLayoutParams = feedbackParams
+    }
+
+    private fun scheduleOverlayVisibilityUpdate() {
+        handler.removeCallbacks(refreshOverlayVisibility)
+        handler.postDelayed(refreshOverlayVisibility, REFRESH_OVERLAY_DELAY_MS)
+    }
+
+    private fun updateOverlayVisibility() {
+        if (state != State.IDLE || hasTextInputContext()) {
+            handler.removeCallbacks(hideOverlay)
+            showOverlayNow()
+        } else {
+            handler.removeCallbacks(hideOverlay)
+            handler.postDelayed(hideOverlay, HIDE_OVERLAY_DELAY_MS)
+        }
+    }
+
+    private fun showOverlayNow() {
+        val view = overlayView ?: return
+        if (view.visibility == View.VISIBLE && view.alpha == 1f) return
+        view.animate().cancel()
+        view.visibility = View.VISIBLE
+        view.animate().alpha(1f).setDuration(140).start()
+    }
+
+    private fun hideOverlayNow() {
+        val view = overlayView ?: return
+        if (view.visibility != View.VISIBLE) return
+        view.animate().cancel()
+        view.animate().alpha(0f).setDuration(180).withEndAction {
+            if (state == State.IDLE && !hasTextInputContext()) {
+                view.visibility = View.GONE
+                feedbackView?.visibility = View.GONE
+            } else {
+                showOverlayNow()
+            }
+        }.start()
+    }
+
+    private fun hasTextInputContext(): Boolean = isImeVisible() || hasFocusedTextInput()
+
+    private fun isImeVisible(): Boolean =
+        windows?.any { it.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD } == true
+
+    private fun hasFocusedTextInput(): Boolean {
+        fun rootHasInputFocus(root: AccessibilityNodeInfo?): Boolean {
+            root ?: return false
+            return try {
+                val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: return false
+                try {
+                    focused.isEditable ||
+                        focused.className?.toString()?.contains("EditText") == true ||
+                        focused.actionList.any { it.id == AccessibilityNodeInfo.ACTION_SET_TEXT }
+                } finally {
+                    focused.recycle()
+                }
+            } finally {
+                root.recycle()
+            }
+        }
+
+        if (rootHasInputFocus(rootInActiveWindow)) return true
+        return windows
+            ?.asSequence()
+            ?.filter { it.type == AccessibilityWindowInfo.TYPE_APPLICATION && (it.isActive || it.isFocused) }
+            ?.any { rootHasInputFocus(it.root) } == true
     }
 
     private fun removeOverlay() {
@@ -304,7 +389,10 @@ class WhisperAccessibilityService : AccessibilityService() {
 
     private fun onTap() {
         when (state) {
-            State.IDLE -> startRecording()
+            State.IDLE -> {
+                vibrate(VibrationEffect.EFFECT_CLICK)
+                startRecording()
+            }
             State.RECORDING -> stopAndTranscribe()
             State.TRANSCRIBING -> {}
         }
@@ -329,6 +417,7 @@ class WhisperAccessibilityService : AccessibilityService() {
         pcmStream = ByteArrayOutputStream()
         audioRecord!!.startRecording()
         state = State.RECORDING
+        updateOverlayVisibility()
         setBusy(false)
         setAppearance(COLOR_RECORDING)
         startPulse()
@@ -356,6 +445,7 @@ class WhisperAccessibilityService : AccessibilityService() {
         pcmStream = null
 
         if (pcm.isEmpty()) { reset("No audio captured"); return }
+        vibrate(VibrationEffect.EFFECT_DOUBLE_CLICK)
 
         val useLocal = prefs().getBoolean("use_local", true)
         val local = localTranscriber
@@ -391,6 +481,7 @@ class WhisperAccessibilityService : AccessibilityService() {
                     state = State.IDLE
                     setBusy(false)
                     setAppearance(COLOR_IDLE)
+                    scheduleOverlayVisibilityUpdate()
                 }
             }
         }
@@ -410,6 +501,7 @@ class WhisperAccessibilityService : AccessibilityService() {
                     state = State.IDLE
                     setBusy(false)
                     setAppearance(COLOR_IDLE)
+                    scheduleOverlayVisibilityUpdate()
                 }
             }
         }
@@ -422,6 +514,7 @@ class WhisperAccessibilityService : AccessibilityService() {
                 state = State.IDLE
                 setBusy(false)
                 setAppearance(COLOR_IDLE)
+                scheduleOverlayVisibilityUpdate()
             }
             return
         }
@@ -437,6 +530,7 @@ class WhisperAccessibilityService : AccessibilityService() {
                     state = State.IDLE
                     setBusy(false)
                     setAppearance(COLOR_IDLE)
+                    scheduleOverlayVisibilityUpdate()
                 }
                 return
             }
@@ -453,6 +547,7 @@ class WhisperAccessibilityService : AccessibilityService() {
                     state = State.IDLE
                     setBusy(false)
                     setAppearance(COLOR_IDLE)
+                    scheduleOverlayVisibilityUpdate()
                 }
             }
         } else {
@@ -461,6 +556,7 @@ class WhisperAccessibilityService : AccessibilityService() {
                 state = State.IDLE
                 setBusy(false)
                 setAppearance(COLOR_IDLE)
+                scheduleOverlayVisibilityUpdate()
             }
         }
     }
@@ -470,6 +566,7 @@ class WhisperAccessibilityService : AccessibilityService() {
         state = State.IDLE
         setBusy(false)
         setAppearance(COLOR_IDLE)
+        scheduleOverlayVisibilityUpdate()
     }
 
     // --- Text injection ---
@@ -480,6 +577,13 @@ class WhisperAccessibilityService : AccessibilityService() {
         feedbackDurationMs: Long = 2000
     ) {
         val clip = ClipData.newPlainText("phonewhisper", text)
+        
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            clip.description.extras = Bundle().apply {
+                putBoolean(ClipDescription.EXTRA_IS_SENSITIVE, true)
+            }
+        }
+        
         val clipboard = (getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager)
         clipboard.setPrimaryClip(clip)
         feedback?.let { showFeedback(it, feedbackDurationMs) }
@@ -500,6 +604,22 @@ class WhisperAccessibilityService : AccessibilityService() {
         }
 
         Log.i(TAG, if (injected) "Text injection action reported success" else "No injection action succeeded; clipboard fallback only")
+        vibrate(
+            if (injected) VibrationEffect.EFFECT_HEAVY_CLICK
+            else VibrationEffect.EFFECT_TICK
+        )
+    }
+
+    private fun vibrate(effectId: Int) {
+        val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            getSystemService(VibratorManager::class.java).defaultVibrator
+        } else {
+            @Suppress("DEPRECATION")
+            getSystemService(VIBRATOR_SERVICE) as Vibrator
+        }
+        if (vibrator.hasVibrator()) {
+            vibrator.vibrate(VibrationEffect.createPredefined(effectId))
+        }
     }
 
     private fun findInjectionCandidates(): List<AccessibilityNodeInfo> {
