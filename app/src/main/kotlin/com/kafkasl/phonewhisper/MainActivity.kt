@@ -30,6 +30,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var keyRowSub: TextView
     private lateinit var promptRowSub: TextView
     private lateinit var promptRow: LinearLayout
+    private lateinit var postProcessingModelRow: LinearLayout
+    private lateinit var postProcessingModelRowSub: TextView
+    private lateinit var postProcessingMinimumLengthRow: LinearLayout
+    private lateinit var postProcessingMinimumLengthRowSub: TextView
     private lateinit var modelContainer: LinearLayout
     private lateinit var promptContainer: LinearLayout
 
@@ -120,6 +124,21 @@ class MainActivity : AppCompatActivity() {
             refresh()
         }
         root.addView(postProcessRow)
+
+        postProcessingModelRow = settingsRow("Cleanup model", postProcessingModel().displayName) {
+            promptPostProcessingModel()
+        }
+        postProcessingModelRowSub = postProcessingModelRow.findViewWithTag("subtitle")
+        root.addView(postProcessingModelRow)
+
+        postProcessingMinimumLengthRow = settingsRow(
+            "Minimum cleanup length",
+            postProcessingMinimumLengthSummary()
+        ) {
+            promptPostProcessingMinimumLength()
+        }
+        postProcessingMinimumLengthRowSub = postProcessingMinimumLengthRow.findViewWithTag("subtitle")
+        root.addView(postProcessingMinimumLengthRow)
 
         promptContainer = vertical(0)
         for (preset in promptPresets()) promptContainer.addView(buildPromptRow(preset))
@@ -317,6 +336,10 @@ class MainActivity : AppCompatActivity() {
         modelContainer.visibility = if (useLocal) View.VISIBLE else View.GONE
         promptContainer.visibility = if (usePostProcessing) View.VISIBLE else View.GONE
         promptRow.visibility = if (usePostProcessing) View.VISIBLE else View.GONE
+        postProcessingModelRow.visibility = if (usePostProcessing) View.VISIBLE else View.GONE
+        postProcessingMinimumLengthRow.visibility = if (usePostProcessing) View.VISIBLE else View.GONE
+        postProcessingModelRowSub.text = postProcessingModel().displayName
+        postProcessingMinimumLengthRowSub.text = postProcessingMinimumLengthSummary()
 
         val apiKey = prefs().getString("api_key", "") ?: ""
         keyRowSub.text = if (apiKey.isBlank()) "Tap to set" 
@@ -385,6 +408,49 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
+    private fun promptPostProcessingModel() {
+        val models = PostProcessor.Model.entries
+        val selected = models.indexOf(postProcessingModel())
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Cleanup model")
+            .setSingleChoiceItems(models.map { it.displayName }.toTypedArray(), selected) { dialog, which ->
+                prefs().edit().putString("post_processing_model", models[which].preferenceValue).apply()
+                dialog.dismiss()
+                refresh()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun promptPostProcessingMinimumLength() {
+        val input = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setText(postProcessingMinimumLength().toString())
+            selectAll()
+            hint = "0–1000"
+        }
+        val dialog = android.app.AlertDialog.Builder(this)
+            .setTitle("Minimum cleanup length")
+            .setMessage("Use 0 to always clean up. Korean characters count as 3.")
+            .setView(input.apply { setPadding(dp(24), dp(8), dp(24), dp(8)) })
+            .setPositiveButton("Save", null)
+            .setNegativeButton("Cancel", null)
+            .create()
+        dialog.setOnShowListener {
+            dialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val value = input.text.toString().toIntOrNull()
+                if (value == null || value !in 0..1000) {
+                    input.error = "Enter a number from 0 to 1000"
+                    return@setOnClickListener
+                }
+                prefs().edit().putInt("post_processing_min_length", value).apply()
+                dialog.dismiss()
+                refresh()
+            }
+        }
+        dialog.show()
+    }
+
     // --- UI Helpers ---
 
     private fun settingsRow(title: String, subtitle: String, widget: View? = null, onClick: (() -> Unit)? = null): LinearLayout {
@@ -441,6 +507,15 @@ class MainActivity : AppCompatActivity() {
 
     private fun currentPrompt() = prefs().getString("post_processing_prompt", PostProcessor.DEFAULT_PROMPT) ?: PostProcessor.DEFAULT_PROMPT
     private fun customPrompt() = prefs().getString("custom_post_processing_prompt", PostProcessor.DEFAULT_PROMPT) ?: PostProcessor.DEFAULT_PROMPT
+    private fun postProcessingModel() = PostProcessor.Model.fromPreference(
+        prefs().getString("post_processing_model", null)
+    )
+    private fun postProcessingMinimumLength() = prefs().getInt("post_processing_min_length", 15)
+    private fun postProcessingMinimumLengthSummary(): String {
+        val minimum = postProcessingMinimumLength()
+        return if (minimum == 0) "Always clean up"
+        else "$minimum weighted characters · Korean characters count as 3"
+    }
 
     private fun customPromptSummary(): String {
         val prompt = customPrompt()

@@ -676,8 +676,9 @@ class WhisperAccessibilityService : AccessibilityService() {
 
         val usePostProcessing = prefs().getBoolean("use_post_processing", false)
         val apiKey = prefs().getString("api_key", "") ?: ""
+        val minimumLength = prefs().getInt("post_processing_min_length", 15)
 
-        if (usePostProcessing) {
+        if (usePostProcessing && PostProcessor.weightedTextLength(text) >= minimumLength) {
             if (apiKey.isBlank()) {
                 handler.post {
                     injectText(text)
@@ -687,6 +688,9 @@ class WhisperAccessibilityService : AccessibilityService() {
             }
 
             val prompt = prefs().getString("post_processing_prompt", PostProcessor.DEFAULT_PROMPT) ?: PostProcessor.DEFAULT_PROMPT
+            val model = PostProcessor.Model.fromPreference(
+                prefs().getString("post_processing_model", null)
+            )
             handler.post {
                 state = State.POST_PROCESSING
                 transitionButtonIcon(R.drawable.ic_post_processing)
@@ -695,7 +699,7 @@ class WhisperAccessibilityService : AccessibilityService() {
                 updateOverlayVisibility()
             }
 
-            PostProcessor.process(text, prompt, apiKey) { result ->
+            PostProcessor.process(text, prompt, apiKey, model) { result ->
                 handler.post {
                     if (result.text != null && result.text.isNotBlank()) {
                         val injected = injectText(result.text)

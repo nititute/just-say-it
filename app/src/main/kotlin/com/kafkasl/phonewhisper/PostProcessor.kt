@@ -10,6 +10,17 @@ import java.io.IOException
 object PostProcessor {
     data class Result(val text: String?, val error: String?)
 
+    enum class Model(val preferenceValue: String, val displayName: String) {
+        LUNA("luna", "GPT-5.6 Luna"),
+        GPT_4O_MINI("gpt-4o-mini", "GPT-4o mini");
+
+        companion object {
+            fun fromPreference(value: String?) = entries.firstOrNull {
+                it.preferenceValue == value
+            } ?: LUNA
+        }
+    }
+
     private val client = OkHttpClient()
 
     const val SIMPLE_PROMPT = "Clean up this speech-to-text transcript. Fix punctuation, capitalization, and obvious speech-to-text errors. Keep the original meaning. Return only the cleaned text."
@@ -65,6 +76,22 @@ Do not include quotes, labels, explanations, markdown, or commentary.
 
     const val DEFAULT_PROMPT = DEV_PROMPT
 
+    /** Counts Korean syllables and jamo as three Latin characters for cleanup thresholding. */
+    fun weightedTextLength(text: String): Int {
+        var length = 0
+        for (codePoint in text.trim().codePoints().toArray()) {
+            length += when (Character.UnicodeBlock.of(codePoint)) {
+                Character.UnicodeBlock.HANGUL_SYLLABLES,
+                Character.UnicodeBlock.HANGUL_JAMO,
+                Character.UnicodeBlock.HANGUL_COMPATIBILITY_JAMO,
+                Character.UnicodeBlock.HANGUL_JAMO_EXTENDED_A,
+                Character.UnicodeBlock.HANGUL_JAMO_EXTENDED_B -> 3
+                else -> 1
+            }
+        }
+        return length
+    }
+
     fun parseResponse(json: String): Result {
         return try {
             val obj = JSONObject(json)
@@ -86,7 +113,13 @@ Do not include quotes, labels, explanations, markdown, or commentary.
         }
     }
 
-    fun process(text: String, prompt: String, apiKey: String, callback: (Result) -> Unit) {
+    fun process(
+        text: String,
+        prompt: String,
+        apiKey: String,
+        model: Model,
+        callback: (Result) -> Unit
+    ) {
         val messages = JSONArray().apply {
             put(JSONObject().apply {
                 put("role", "system")
@@ -99,10 +132,17 @@ Do not include quotes, labels, explanations, markdown, or commentary.
         }
 
         val bodyJson = JSONObject().apply {
-            put("model", "gpt-5.6-luna")
             put("messages", messages)
-            // put("temperature", 0.0)
-            put("reasoning_effort", "none")
+            when (model) {
+                Model.LUNA -> {
+                    put("model", "gpt-5.6-luna")
+                    put("reasoning_effort", "none")
+                }
+                Model.GPT_4O_MINI -> {
+                    put("model", "gpt-4o-mini")
+                    put("temperature", 0.0)
+                }
+            }
         }
 
         val body = bodyJson.toString().toRequestBody("application/json".toMediaType())
