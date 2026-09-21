@@ -480,7 +480,8 @@ class WhisperAccessibilityService : AccessibilityService() {
         feedbackDurationMs: Long = 2000
     ) {
         val clip = ClipData.newPlainText("phonewhisper", text)
-        (getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(clip)
+        val clipboard = (getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager)
+        clipboard.setPrimaryClip(clip)
         feedback?.let { showFeedback(it, feedbackDurationMs) }
 
         val candidates = findInjectionCandidates()
