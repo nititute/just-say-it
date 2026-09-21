@@ -2,18 +2,23 @@ package com.kafkasl.phonewhisper
 
 import android.accessibilityservice.AccessibilityService
 import android.content.ClipData
+import android.content.ClipDescription
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.res.ColorStateList
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.PersistableBundle
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -30,6 +35,7 @@ import android.widget.ImageView
 import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
+import okhttp3.Call
 import java.io.ByteArrayOutputStream
 import kotlin.concurrent.thread
 import kotlin.math.abs
@@ -48,15 +54,22 @@ class WhisperAccessibilityService : AccessibilityService() {
         private const val FEEDBACK_OFFSET_DP = 72
         private const val HIDE_OVERLAY_DELAY_MS = 450L
         private const val REFRESH_OVERLAY_DELAY_MS = 80L
+        private const val CANCEL_LONG_PRESS_MS = 2000L
+        private const val RESULT_DISPLAY_MS = 1000L
+        private const val MAX_TRANSCRIPTION_RETRIES = 2
+        private const val TRANSCRIPTION_RETRY_BASE_DELAY_MS = 750L
 
         private const val COLOR_IDLE = 0xDD1C1C1E.toInt()
         private const val COLOR_RECORDING = 0xDDEF4444.toInt()
         private const val COLOR_BUSY = 0xDD6B6B6B.toInt()
+        private const val COLOR_POST_PROCESSING = 0xDD6750A4.toInt()
+        private const val COLOR_SUCCESS = 0xDD2E7D32.toInt()
+        private const val COLOR_FAILURE = 0xDDC62828.toInt()
         private const val COLOR_FEEDBACK_BG = 0xEE1C1C1E.toInt()
         private const val COLOR_RING = 0xFFE8EAED.toInt()
     }
 
-    private enum class State { IDLE, RECORDING, TRANSCRIBING }
+    private enum class State { IDLE, RECORDING, TRANSCRIBING, POST_PROCESSING, RESULT }
 
     private var state = State.IDLE
     private var overlayView: FrameLayout? = null
@@ -67,6 +80,13 @@ class WhisperAccessibilityService : AccessibilityService() {
     private var feedbackLayoutParams: WindowManager.LayoutParams? = null
     private var audioRecord: AudioRecord? = null
     private var pcmStream: ByteArrayOutputStream? = null
+    private val audioManager by lazy { getSystemService(AUDIO_SERVICE) as AudioManager }
+    private var audioFocusRequest: AudioFocusRequest? = null
+    private var hasRecordingAudioFocus = false
+    private var activeTranscriptionCall: Call? = null
+    private var transcriptionRetry: Runnable? = null
+    private var transcriptionAttempt = 0
+    private var transcriptionGeneration = 0
     private val handler = Handler(Looper.getMainLooper())
     private val hideFeedback = Runnable {
         feedbackView?.animate()?.alpha(0f)?.setDuration(180)?.withEndAction {
@@ -76,6 +96,19 @@ class WhisperAccessibilityService : AccessibilityService() {
     private val refreshOverlayVisibility = Runnable { updateOverlayVisibility() }
     private val hideOverlay = Runnable {
         if (state == State.IDLE && !hasTextInputContext()) hideOverlayNow()
+    }
+    private var longPressTriggered = false
+    private val cancelLongPress = Runnable {
+        if (state == State.RECORDING || state == State.TRANSCRIBING) {
+            longPressTriggered = true
+            if (state == State.RECORDING) cancelRecording() else cancelTranscription()
+        }
+    }
+    private val finishResultDisplay = Runnable {
+        state = State.IDLE
+        transitionButtonIcon(R.drawable.ic_mic)
+        setAppearance(COLOR_IDLE)
+        scheduleOverlayVisibilityUpdate()
     }
 
     // Local transcription engine (loaded lazily)
@@ -100,9 +133,13 @@ class WhisperAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         instance = null
+        abandonRecordingAudioFocus()
         handler.removeCallbacks(refreshOverlayVisibility)
         handler.removeCallbacks(hideOverlay)
         handler.removeCallbacks(hideFeedback)
+        handler.removeCallbacks(cancelLongPress)
+        handler.removeCallbacks(finishResultDisplay)
+        cancelPendingTranscription()
         removeOverlay()
         super.onDestroy()
     }
@@ -177,9 +214,15 @@ class WhisperAccessibilityService : AccessibilityService() {
                 MotionEvent.ACTION_DOWN -> {
                     startX = params.x; startY = params.y
                     touchX = ev.rawX; touchY = ev.rawY
+                    longPressTriggered = false
+                    if (state == State.RECORDING || state == State.TRANSCRIBING) {
+                        handler.postDelayed(cancelLongPress, CANCEL_LONG_PRESS_MS)
+                    }
                     true
                 }
                 MotionEvent.ACTION_MOVE -> {
+                    val moved = abs(ev.rawX - touchX) + abs(ev.rawY - touchY)
+                    if (moved >= TAP_THRESHOLD_DP * dp) handler.removeCallbacks(cancelLongPress)
                     params.x = startX + (ev.rawX - touchX).toInt()
                     params.y = startY + (ev.rawY - touchY).toInt()
                     wm.updateViewLayout(v, params)
@@ -190,8 +233,11 @@ class WhisperAccessibilityService : AccessibilityService() {
                     true
                 }
                 MotionEvent.ACTION_UP -> {
+                    handler.removeCallbacks(cancelLongPress)
                     val moved = abs(ev.rawX - touchX) + abs(ev.rawY - touchY)
-                    if (moved < TAP_THRESHOLD_DP * dp) {
+                    if (longPressTriggered) {
+                        longPressTriggered = false
+                    } else if (moved < TAP_THRESHOLD_DP * dp) {
                         onTap()
                     } else {
                         params.x = if (params.x + ringSize / 2 > screenW / 2)
@@ -202,6 +248,11 @@ class WhisperAccessibilityService : AccessibilityService() {
                             wm.updateViewLayout(feedbackView, it)
                         }
                     }
+                    true
+                }
+                MotionEvent.ACTION_CANCEL -> {
+                    handler.removeCallbacks(cancelLongPress)
+                    longPressTriggered = false
                     true
                 }
                 else -> false
@@ -334,6 +385,17 @@ class WhisperAccessibilityService : AccessibilityService() {
         handler.post { button?.background = circle(color) }
     }
 
+    private fun transitionButtonIcon(iconRes: Int) {
+        handler.post {
+            val view = button ?: return@post
+            view.animate().cancel()
+            view.animate().alpha(0f).setDuration(80).withEndAction {
+                view.setImageResource(iconRes)
+                view.animate().alpha(1f).setDuration(140).start()
+            }.start()
+        }
+    }
+
     private fun setBusy(visible: Boolean) {
         handler.post {
             spinner?.visibility = if (visible) View.VISIBLE else View.GONE
@@ -394,7 +456,7 @@ class WhisperAccessibilityService : AccessibilityService() {
                 startRecording()
             }
             State.RECORDING -> stopAndTranscribe()
-            State.TRANSCRIBING -> {}
+            State.TRANSCRIBING, State.POST_PROCESSING, State.RESULT -> {}
         }
     }
 
@@ -404,18 +466,40 @@ class WhisperAccessibilityService : AccessibilityService() {
             toast("Grant audio permission in Phone Whisper app"); return
         }
 
+        requestRecordingAudioFocus()
+
         val bufSize = AudioRecord.getMinBufferSize(
             SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
         )
+        if (bufSize <= 0) {
+            abandonRecordingAudioFocus()
+            toast("Unable to initialize microphone")
+            return
+        }
         audioRecord = try {
             AudioRecord(
                 MediaRecorder.AudioSource.MIC, SAMPLE_RATE,
                 AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufSize
             )
-        } catch (_: SecurityException) { toast("Audio permission denied"); return }
+        } catch (e: Exception) {
+            Log.e(TAG, "Unable to initialize microphone", e)
+            abandonRecordingAudioFocus()
+            toast("Unable to initialize microphone")
+            return
+        }
 
         pcmStream = ByteArrayOutputStream()
-        audioRecord!!.startRecording()
+        try {
+            audioRecord!!.startRecording()
+        } catch (e: IllegalStateException) {
+            Log.e(TAG, "Unable to start recording", e)
+            audioRecord?.release()
+            audioRecord = null
+            pcmStream = null
+            abandonRecordingAudioFocus()
+            toast("Unable to start recording")
+            return
+        }
         state = State.RECORDING
         updateOverlayVisibility()
         setBusy(false)
@@ -434,12 +518,20 @@ class WhisperAccessibilityService : AccessibilityService() {
     private fun stopAndTranscribe() {
         state = State.TRANSCRIBING
         stopPulse()
+        transitionButtonIcon(R.drawable.ic_transcribing)
         setAppearance(COLOR_BUSY)
         setBusy(true)
 
-        audioRecord?.stop()
-        audioRecord?.release()
-        audioRecord = null
+        try {
+            audioRecord?.stop()
+        } catch (e: IllegalStateException) {
+            Log.w(TAG, "AudioRecord was not recording when stopped", e)
+        } finally {
+            audioRecord?.release()
+            audioRecord = null
+            // Resume media as soon as capture ends; transcription can continue silently.
+            abandonRecordingAudioFocus()
+        }
 
         val pcm = pcmStream?.toByteArray() ?: ByteArray(0)
         pcmStream = null
@@ -455,6 +547,59 @@ class WhisperAccessibilityService : AccessibilityService() {
         } else {
             transcribeApi(pcm)
         }
+    }
+
+    private fun cancelRecording() {
+        state = State.RESULT
+        stopPulse()
+        try {
+            audioRecord?.stop()
+        } catch (e: IllegalStateException) {
+            Log.w(TAG, "AudioRecord was not recording when cancelled", e)
+        } finally {
+            audioRecord?.release()
+            audioRecord = null
+            pcmStream = null
+            abandonRecordingAudioFocus()
+        }
+        showResult(success = false, message = "Recording cancelled")
+    }
+
+    private fun cancelTranscription() {
+        cancelPendingTranscription()
+        showResult(success = false, message = "Transcription cancelled")
+    }
+
+    private fun cancelPendingTranscription() {
+        transcriptionGeneration++
+        activeTranscriptionCall?.cancel()
+        activeTranscriptionCall = null
+        transcriptionRetry?.let(handler::removeCallbacks)
+        transcriptionRetry = null
+    }
+
+    private fun requestRecordingAudioFocus() {
+        val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+            )
+            .setOnAudioFocusChangeListener { /* Recording owns focus only while capture is active. */ }
+            .build()
+
+        audioFocusRequest = request
+        hasRecordingAudioFocus =
+            audioManager.requestAudioFocus(request) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        if (!hasRecordingAudioFocus) Log.w(TAG, "Recording audio focus was not granted")
+    }
+
+    private fun abandonRecordingAudioFocus() {
+        val request = audioFocusRequest ?: return
+        if (hasRecordingAudioFocus) audioManager.abandonAudioFocusRequest(request)
+        audioFocusRequest = null
+        hasRecordingAudioFocus = false
     }
 
     private fun transcribeLocal(pcm: ByteArray, transcriber: LocalTranscriber) {
@@ -477,11 +622,7 @@ class WhisperAccessibilityService : AccessibilityService() {
             } catch (e: Exception) {
                 Log.e(TAG, "Local transcription failed", e)
                 handler.post {
-                    toast("Local error: ${e.message}")
-                    state = State.IDLE
-                    setBusy(false)
-                    setAppearance(COLOR_IDLE)
-                    scheduleOverlayVisibilityUpdate()
+                    showResult(success = false, message = "Local transcription failed")
                 }
             }
         }
@@ -492,16 +633,34 @@ class WhisperAccessibilityService : AccessibilityService() {
         val apiKey = prefs().getString("api_key", "") ?: ""
         if (apiKey.isBlank()) { reset("Set API key in Phone Whisper app"); return }
 
-        TranscriberClient.transcribe(wav, apiKey) { result ->
-            if (result.text != null && result.text.isNotBlank()) {
-                handleTranscriptionResult(result.text)
-            } else {
-                handler.post {
-                    toast("Error: ${result.error ?: "empty transcript"}")
-                    state = State.IDLE
-                    setBusy(false)
-                    setAppearance(COLOR_IDLE)
-                    scheduleOverlayVisibilityUpdate()
+        cancelPendingTranscription()
+        val generation = transcriptionGeneration
+        transcriptionAttempt = 0
+        startTranscriptionAttempt(wav, apiKey, generation)
+    }
+
+    private fun startTranscriptionAttempt(wav: ByteArray, apiKey: String, generation: Int) {
+        if (generation != transcriptionGeneration || state != State.TRANSCRIBING) return
+
+        activeTranscriptionCall = TranscriberClient.transcribe(wav, apiKey) { result ->
+            handler.post {
+                if (generation != transcriptionGeneration || state != State.TRANSCRIBING) return@post
+                activeTranscriptionCall = null
+                if (result.text != null && result.text.isNotBlank()) {
+                    handleTranscriptionResult(result.text)
+                } else if (result.retryable && transcriptionAttempt < MAX_TRANSCRIPTION_RETRIES) {
+                    transcriptionAttempt++
+                    val delay = TRANSCRIPTION_RETRY_BASE_DELAY_MS * transcriptionAttempt
+                    showFeedback(
+                        "Network issue — retrying ($transcriptionAttempt/$MAX_TRANSCRIPTION_RETRIES)",
+                        delay + 1000
+                    )
+                    transcriptionRetry = Runnable {
+                        transcriptionRetry = null
+                        startTranscriptionAttempt(wav, apiKey, generation)
+                    }.also { handler.postDelayed(it, delay) }
+                } else {
+                    showResult(success = false, message = result.error ?: "Transcription failed")
                 }
             }
         }
@@ -510,11 +669,7 @@ class WhisperAccessibilityService : AccessibilityService() {
     private fun handleTranscriptionResult(text: String?) {
         if (text.isNullOrBlank()) {
             handler.post {
-                toast("No speech detected")
-                state = State.IDLE
-                setBusy(false)
-                setAppearance(COLOR_IDLE)
-                scheduleOverlayVisibilityUpdate()
+                showResult(success = false, message = "No speech detected")
             }
             return
         }
@@ -525,48 +680,66 @@ class WhisperAccessibilityService : AccessibilityService() {
         if (usePostProcessing) {
             if (apiKey.isBlank()) {
                 handler.post {
-                    toast("Post-processing needs API key. Using raw text.")
                     injectText(text)
-                    state = State.IDLE
-                    setBusy(false)
-                    setAppearance(COLOR_IDLE)
-                    scheduleOverlayVisibilityUpdate()
+                    showResult(success = false, message = "Cleanup skipped — raw text used")
                 }
                 return
             }
 
             val prompt = prefs().getString("post_processing_prompt", PostProcessor.DEFAULT_PROMPT) ?: PostProcessor.DEFAULT_PROMPT
-            
+            handler.post {
+                state = State.POST_PROCESSING
+                transitionButtonIcon(R.drawable.ic_post_processing)
+                setAppearance(COLOR_POST_PROCESSING)
+                setBusy(true)
+                updateOverlayVisibility()
+            }
+
             PostProcessor.process(text, prompt, apiKey) { result ->
                 handler.post {
                     if (result.text != null && result.text.isNotBlank()) {
-                        injectText(result.text)
+                        val injected = injectText(result.text)
+                        showResult(
+                            success = injected,
+                            message = if (injected) null else "Copied to clipboard"
+                        )
                     } else {
                         injectText(text, feedback = "Cleanup failed — raw copied to clipboard", feedbackDurationMs = 3000)
+                        showResult(success = false, message = "Cleanup failed — raw text used")
                     }
-                    state = State.IDLE
-                    setBusy(false)
-                    setAppearance(COLOR_IDLE)
-                    scheduleOverlayVisibilityUpdate()
                 }
             }
         } else {
             handler.post {
-                injectText(text)
-                state = State.IDLE
-                setBusy(false)
-                setAppearance(COLOR_IDLE)
-                scheduleOverlayVisibilityUpdate()
+                val injected = injectText(text)
+                showResult(
+                    success = injected,
+                    message = if (injected) null else "Copied to clipboard"
+                )
             }
         }
     }
 
     private fun reset(msg: String) {
-        toast(msg)
-        state = State.IDLE
+        showResult(success = false, message = msg)
+    }
+
+    private fun showResult(success: Boolean, message: String? = null) {
+        handler.removeCallbacks(finishResultDisplay)
+        state = State.RESULT
+        stopPulse()
         setBusy(false)
-        setAppearance(COLOR_IDLE)
-        scheduleOverlayVisibilityUpdate()
+        transitionButtonIcon(
+            if (success) R.drawable.ic_result_success else R.drawable.ic_result_failure
+        )
+        setAppearance(if (success) COLOR_SUCCESS else COLOR_FAILURE)
+        updateOverlayVisibility()
+        message?.let { showFeedback(it, RESULT_DISPLAY_MS) }
+        vibrate(
+            if (success) VibrationEffect.EFFECT_HEAVY_CLICK
+            else VibrationEffect.EFFECT_TICK
+        )
+        handler.postDelayed(finishResultDisplay, RESULT_DISPLAY_MS)
     }
 
     // --- Text injection ---
@@ -575,11 +748,11 @@ class WhisperAccessibilityService : AccessibilityService() {
         text: String,
         feedback: String? = "Copied to clipboard",
         feedbackDurationMs: Long = 2000
-    ) {
+    ): Boolean {
         val clip = ClipData.newPlainText("phonewhisper", text)
         
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            clip.description.extras = Bundle().apply {
+            clip.description.extras = PersistableBundle().apply {
                 putBoolean(ClipDescription.EXTRA_IS_SENSITIVE, true)
             }
         }
@@ -604,10 +777,7 @@ class WhisperAccessibilityService : AccessibilityService() {
         }
 
         Log.i(TAG, if (injected) "Text injection action reported success" else "No injection action succeeded; clipboard fallback only")
-        vibrate(
-            if (injected) VibrationEffect.EFFECT_HEAVY_CLICK
-            else VibrationEffect.EFFECT_TICK
-        )
+        return injected
     }
 
     private fun vibrate(effectId: Int) {

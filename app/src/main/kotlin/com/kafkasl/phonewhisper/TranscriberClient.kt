@@ -7,7 +7,7 @@ import org.json.JSONObject
 import java.io.IOException
 
 object TranscriberClient {
-    data class Result(val text: String?, val error: String?)
+    data class Result(val text: String?, val error: String?, val retryable: Boolean = false)
 
     private val client = OkHttpClient()
 
@@ -22,7 +22,7 @@ object TranscriberClient {
         Result(null, e.message ?: "Parse error")
     }
 
-    fun transcribe(wavData: ByteArray, apiKey: String, callback: (Result) -> Unit) {
+    fun transcribe(wavData: ByteArray, apiKey: String, callback: (Result) -> Unit): Call {
         val body = MultipartBody.Builder()
             .setType(MultipartBody.FORM)
             .addFormDataPart("model", "whisper-1")
@@ -35,10 +35,21 @@ object TranscriberClient {
             .post(body)
             .build()
 
-        client.newCall(request).enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) = callback(Result(null, e.message))
-            override fun onResponse(call: Call, response: Response) =
-                callback(parseResponse(response.body?.string() ?: ""))
-        })
+        return client.newCall(request).also { call ->
+            call.enqueue(object : Callback {
+                override fun onFailure(call: Call, e: IOException) =
+                    callback(Result(null, e.message, retryable = !call.isCanceled()))
+
+                override fun onResponse(call: Call, response: Response) {
+                    val result = parseResponse(response.body?.string() ?: "")
+                    callback(
+                        result.copy(
+                            retryable = !response.isSuccessful &&
+                                (response.code == 408 || response.code == 429 || response.code >= 500)
+                        )
+                    )
+                }
+            })
+        }
     }
 }
